@@ -1,0 +1,206 @@
+#include <string.h>
+#include <stdatomic.h>
+#include "vb_protocol.h"
+#include "vb_adapter.h"
+#include "vb_cmd.h"
+#include "stdbool.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "freertos/ringbuf.h"
+
+#define TAG "vb_audio"
+
+#define RECV_BUF_LENGTH CONFIG_VB_AUDIO_INPUT_FRAME_LEN*30
+#define SEND_BUF_LENGTH CONFIG_VB_AUDIO_OUTPUT_FRAME_LEN*10
+#define AUDIO_SEND_CHENK_MS      10
+
+// 音频输入输出允许
+static atomic_bool s_output_enable = false;
+static atomic_bool s_input_enable = false;
+static atomic_bool s_playback_blocked = false;
+
+static uint8_t s_volume = 0;
+
+static RingbufHandle_t s_rx_ringbuffer = NULL;
+static RingbufHandle_t s_tx_ringbuffer = NULL;
+
+
+int _get_volume_handle(uint8_t *data, uint16_t len, void *arg){
+    uint8_t *volume = (uint8_t *)data;
+    s_volume = (uint8_t)(((int)100*volume[0])/30);
+    vb_event_emit(VB_EVT_VOL_CHANGE, &s_volume, sizeof(s_volume));
+    return 0;
+}
+
+uint8_t vb_audio_get_volume(){
+    uint8_t *recv_buf = NULL;
+    uint16_t recv_len = 0;
+    if(vb_protocol_send_block(VB_CMD_GET_VOLUME, NULL, 0, &recv_buf, &recv_len, 100)>=1){
+        s_volume = (uint8_t)(((int)100*recv_buf[0])/30);
+    }
+    return s_volume;
+}
+
+void vb_audio_set_volume(uint8_t volume){
+    uint8_t vol = (uint8_t)((int)(volume * 31) / 100);
+    vb_protocol_send(VB_CMD_SEND_VOLUME, &vol, 1);
+}
+
+uint16_t vb_audio_read(uint8_t *data, uint16_t size){
+    size_t item_size = 0;
+    uint32_t timeout = 40;
+    uint32_t start_time = xTaskGetTickCount()/portTICK_PERIOD_MS;
+    while (s_input_enable)
+    {
+        char *item = (char *)xRingbufferReceive(s_rx_ringbuffer, &item_size, pdMS_TO_TICKS(2));
+        if (item)
+        {
+            if (size < item_size)
+            {
+                ESP_LOGE(TAG, "size is too small, item_size = %d, size = %d", item_size, size);
+                item_size = 0;
+            }else{
+                memcpy(data, item, item_size);
+            }
+            vRingbufferReturnItem(s_rx_ringbuffer, (void *)item);
+            break;
+        }
+        if(timeout != -1 && ((xTaskGetTickCount()/portTICK_PERIOD_MS) - start_time) > timeout){
+            break;
+        }else{
+            vTaskDelay(pdMS_TO_TICKS(2));
+        }
+    }
+
+    return item_size;
+}
+
+int vb_audio_input(uint8_t *data, uint16_t len, void *arg){
+    if(s_input_enable){
+        while (xRingbufferSend(s_rx_ringbuffer, (void *)data, len, 0) != pdTRUE) {
+            size_t item_size = 0;
+            // ESP_LOGE(TAG, "xRingbufferSend failed");
+            uint8_t *item = (uint8_t *)xRingbufferReceive(s_rx_ringbuffer, &item_size, 0);
+            if (item != NULL) {
+                vRingbufferReturnItem(s_rx_ringbuffer, (void *)item);
+            } else {
+                break;
+            }
+        }
+    }
+    return 0;
+}
+
+uint16_t vb_audio_write(uint8_t *data, uint16_t len){
+    uint16_t written = 0;
+    while (s_output_enable && !s_playback_blocked && written < len) {
+        uint16_t chunk = len - written;
+        if (chunk > CONFIG_VB_AUDIO_OUTPUT_FRAME_LEN) {
+            chunk = CONFIG_VB_AUDIO_OUTPUT_FRAME_LEN;
+        }
+        // Never leave the playback task stuck if the UART sender stops draining.
+        if (xRingbufferSend(s_tx_ringbuffer, data + written, chunk,
+                            pdMS_TO_TICKS(100)) != pdTRUE) {
+            ESP_LOGE(TAG, "Audio TX queue stalled, queued %u/%u bytes", written, len);
+            break;
+        }
+        written += chunk;
+    }
+    return written;
+}
+
+void vb_audio_enable_input(bool enable){
+    s_input_enable = enable;
+}
+
+void vb_audio_flush_input(void){
+    if (s_rx_ringbuffer == NULL) {
+        return;
+    }
+    size_t item_size = 0;
+    uint8_t *item;
+    while ((item = (uint8_t *)xRingbufferReceive(s_rx_ringbuffer, &item_size, 0)) != NULL) {
+        vRingbufferReturnItem(s_rx_ringbuffer, item);
+    }
+}
+
+void vb_audio_enable_output(bool enable){
+    s_output_enable = enable && !s_playback_blocked;
+}
+
+void vb_audio_set_playback_blocked(bool blocked){
+    if (!blocked && s_tx_ringbuffer != NULL) {
+        // Drop the previous conversation's UART backlog before reopening output.
+        // The output writer has finished while the music gate was still closed.
+        size_t item_size = 0;
+        uint8_t *item;
+        while ((item = (uint8_t *)xRingbufferReceiveUpTo(s_tx_ringbuffer, &item_size, 0,
+                    CONFIG_VB_AUDIO_OUTPUT_FRAME_LEN)) != NULL) {
+            vRingbufferReturnItem(s_tx_ringbuffer, item);
+        }
+    }
+    s_playback_blocked = blocked;
+    if (blocked) {
+        s_output_enable = false;
+    }
+}
+
+
+#if CONFIG_VB_SEND_USE_TASK
+void __send_task(void *arg) {
+    TickType_t last_time = xTaskGetTickCount();
+    TickType_t last_send_time = 0;
+    bool sent_audio = false;
+    vb_audio_get_volume();
+    while (1)
+    {
+        size_t item_size = 0;
+        // Drain even while output is disabled, releasing any blocked producer.
+        uint8_t *item = (uint8_t *)xRingbufferReceiveUpTo(s_tx_ringbuffer,
+            &item_size, portMAX_DELAY, CONFIG_VB_AUDIO_OUTPUT_FRAME_LEN);
+        if (item == NULL) {
+            continue;
+        }
+        if (!s_output_enable || s_playback_blocked) {
+            vRingbufferReturnItem(s_tx_ringbuffer, item);
+            continue;
+        }
+
+        TickType_t now_time = xTaskGetTickCount();
+        if (!sent_audio || now_time - last_send_time >= pdMS_TO_TICKS(1000)) {
+            ESP_LOGI(TAG, "UART audio TX started, frame bytes: %u", (unsigned)item_size);
+        }
+        sent_audio = true;
+        last_send_time = now_time;
+        if (now_time - last_time >= pdMS_TO_TICKS(AUDIO_SEND_CHENK_MS)) {
+            last_time = now_time;
+        }
+        vb_protocol_send(VB_CMD_SEND_AUDIO, item, item_size);
+        vRingbufferReturnItem(s_tx_ringbuffer, item);
+        vTaskDelayUntil(&last_time, pdMS_TO_TICKS(AUDIO_SEND_CHENK_MS));
+    }
+}
+#endif
+
+void vb_audio_init(){
+    s_rx_ringbuffer = xRingbufferCreate(RECV_BUF_LENGTH, RINGBUF_TYPE_NOSPLIT);
+    s_tx_ringbuffer = xRingbufferCreate(SEND_BUF_LENGTH, RINGBUF_TYPE_BYTEBUF);
+#if CONFIG_VB_SEND_USE_TASK
+    xTaskCreate(__send_task, "__send_task", CONFIG_VB_SEND_TASK_STACK_SIZE, NULL, 9, NULL);
+#else
+    esp_timer_handle_t send_timer = NULL;
+    esp_timer_create_args_t timer_args = {
+        .callback = __send_timer_cb,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "vb_send",
+        .skip_unhandled_events = true,
+    };
+    esp_timer_create(&timer_args, &send_timer);
+    if(send_timer){
+        esp_timer_start_periodic(send_timer, AUDIO_SEND_CHENK_MS*1000);
+    }else{
+        ESP_LOGE(TAG, "send_timer is null");
+    }
+#endif
+
+}

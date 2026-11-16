@@ -1,0 +1,19 @@
+CONFIG_BOARD_PATH="../../firmware/zuowei_v2/mz60-yx-c3/jdyz-yx-c3"
+
+# VB module sends Opus frames and receives PCM audio.
+CONFIG_USE_AUDIO_CODEC_ENCODE_OPUS=y
+CONFIG_USE_AUDIO_CODEC_DECODE_OPUS=n
+
+# Buffer bursts while ESP32-C3 is decoding audio and feeding the 701 UART.
+CONFIG_LWIP_UDP_RECVMBOX_SIZE=16
+
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions/v1/8m_modify.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions/v1/8m_modify.csv"
+
+CONFIG_USE_DEVICE_AEC=y
+
+CONFIG_DEVICE_AEC_DEFAULT_OFF=y
+
+CONFIG_CUSTOM_BOARD_TYPE="zw-dqy-c3-7014-aec-mix"
+CONFIG_WIFI_CONFIG_MODE_SSID_PREFIX="zw-dqy-c3"

@@ -1,0 +1,17 @@
+dependencies:
+  78/uart-uhci: ~0.2.1
+  espressif/iot_eth: ^0.1.0
+  idf: '>=5.5.2'
+description: UART Ethernet Modem component for ESP32
+files:
+  exclude:
+  - .git
+  - dist
+  - build
+license: Apache-2.0
+repository: git://github.com/78/uart-eth-modem.git
+repository_info:
+  commit_sha: a4b4a6e6d7ca49d7a60daa436bd425115fd3b4f8
+  path: .
+url: https://github.com/78/uart-eth-modem
+version: 0.4.2
